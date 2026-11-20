@@ -185,11 +185,13 @@ def distinct_snapshots(history):
 def fit_players(snaps, t_at, t_target):
     """Forecast players tracked at the target.
 
-    Returns (n_target, n_at): the fitted N at the target and at the
-    checkpoint. With 2+ distinct snapshots, fits log N against log hours
-    (power law) and against hours (exponential) and keeps the better fit.
-    With one snapshot, uses the launch-night doubling prior from the time
-    of the first read.
+    Returns (n_target, n_at, n_fn): the fitted N at the target and at the
+    checkpoint, and N as a function of hours since launch. With 2+ distinct
+    snapshots, fits log N against log hours (power law) and against hours
+    (exponential) and keeps the better fit; both slopes are clamped to sane
+    growth (a negative fit means the refreshes disagree, and is read as
+    flat). With one snapshot, uses the launch-night doubling prior from the
+    time of the first read.
     """
     n_last = snaps[-1]["n"]
     if len(snaps) >= 2:
@@ -198,21 +200,24 @@ def fit_players(snaps, t_at, t_target):
         ys = [math.log(s["n"]) for s in snaps]
         a_pow, b_pow, rmse_pow = ols(xs_log, ys)
         a_exp, b_exp, rmse_exp = ols(xs_lin, ys)
+        b_pow = min(max(b_pow, 0.0), 2.0)
+        b_exp = min(max(b_exp, 0.0), 0.5)
         if rmse_pow <= rmse_exp:
-            n_target = math.exp(a_pow + b_pow * math.log(t_target))
-            n_at = math.exp(a_pow + b_pow * math.log(t_at))
+            n_fn = lambda t: math.exp(a_pow + b_pow * math.log(max(t, 0.25)))
         else:
-            n_target = math.exp(a_exp + b_exp * t_target)
-            n_at = math.exp(a_exp + b_exp * t_at)
-        n_target = min(max(n_target, n_last), n_last * MAX_N_GROWTH)
-        n_at = min(max(n_at, n_last), n_last * MAX_N_GROWTH)
-        return n_target, n_at
+            n_fn = lambda t: math.exp(a_exp + b_exp * t)
+        n_target = min(max(n_fn(t_target), n_last), n_last * MAX_N_GROWTH)
+        n_at = min(max(n_fn(t_at), n_last), n_last * MAX_N_GROWTH)
+        return n_target, n_at, n_fn
     t_first = snaps[0]["t"]
-    n_target = n_last * 2.0 ** ((t_target - t_first) / LAUNCH_DOUBLING_HOURS)
-    n_at = n_last * 2.0 ** ((t_at - t_first) / LAUNCH_DOUBLING_HOURS)
-    n_target = min(n_target, n_last * MAX_N_GROWTH)
-    n_at = min(n_at, n_last * MAX_N_GROWTH)
-    return n_target, n_at
+    n0 = snaps[0]["n"]
+    n_fn = lambda t: min(
+        n0 * 2.0 ** ((t - t_first) / LAUNCH_DOUBLING_HOURS),
+        n0 * MAX_N_GROWTH,
+    )
+    n_target = min(n_fn(t_target), n_last * MAX_N_GROWTH)
+    n_at = min(n_fn(t_at), n_last * MAX_N_GROWTH)
+    return n_target, n_at, n_fn
 
 
 def player_hours(snaps, n_fit_fn, t_from, t_to, steps=400):
@@ -243,28 +248,7 @@ def forecast_case(case):
     horizon_hours = case["horizon_minutes"] / 60.0
 
     snaps = distinct_snapshots(history)
-    n_target, n_at = fit_players(snaps, t_at, t_target)
-
-    # N(t) for the exposure integral: reuse the fitted shape. Rebuild the
-    # chosen fit as a function of t (power law or exponential; single
-    # snapshot: the doubling prior from the first read).
-    if len(snaps) >= 2:
-        xs_log = [math.log(s["t"]) for s in snaps]
-        xs_lin = [s["t"] for s in snaps]
-        ys = [math.log(s["n"]) for s in snaps]
-        a_pow, b_pow, rmse_pow = ols(xs_log, ys)
-        a_exp, b_exp, rmse_exp = ols(xs_lin, ys)
-        if rmse_pow <= rmse_exp:
-            n_fn = lambda t: math.exp(a_pow + b_pow * math.log(max(t, 0.25)))
-        else:
-            n_fn = lambda t: math.exp(a_exp + b_exp * t)
-    else:
-        t_first = snaps[0]["t"]
-        n0 = snaps[0]["n"]
-        n_fn = lambda t: min(
-            n0 * 2.0 ** ((t - t_first) / LAUNCH_DOUBLING_HOURS),
-            n0 * MAX_N_GROWTH,
-        )
+    n_target, n_at, n_fn = fit_players(snaps, t_at, t_target)
 
     # Cumulative player-hours at each distinct snapshot, and at the target.
     exposures = []
